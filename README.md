@@ -220,3 +220,102 @@ graph TD
 3. **yomu-core-api** — Refactor existing backend into core-api service, add event publishing
 4. **yomu-gamification-engine** — Rust service for gamification logic
 5. **Vercel proxy update** — Change rewrite destination from EC2 IP to Railway gateway URL
+
+### Architecture Modification Justification
+
+This section explains why the current architecture is being changed and the reasoning behind key design decisions.
+
+#### Why Split Into Microservices?
+
+**Current State:** Single Spring Boot monolith (`yomu-backend`) handles all modules: auth, readings, quizzes, achievements, gamification logic, and event publishing.
+
+**Problem (per `yomu.md` line 165-169):**
+> "setiap modul harus berinteraksi dengan modul lain melalui mekanisme komunikasi yang terdefinisi dengan jelas, tanpa berbagi state atau pemanggilan langsung antar komponen"
+
+The current monolith violates this — achievement and gamification logic are entangled in the same codebase, making independent iteration difficult and violating the separation of concerns requirement.
+
+**Solution:** Split into two services:
+- `yomu-core-api` — handles domain logic, publishes events
+- `yomu-gamification-engine` (Rust) — handles all gamification logic (XP, achievements, leaderboards, buffs, seasons)
+
+#### Why yomu-gateway?
+
+**Problem:** Current backend is directly exposed to the internet with JWT handling in the same service. Adding CORS, rate limiting, or changing routing requires modifying the core service.
+
+**Solution:** `yomu-gateway` (Spring Cloud Gateway) acts as single entry point:
+- Strips `Authorization` header, injects `X-User-Id`, `X-User-Role`, `X-Username` headers
+- Frontend never sees core-api URL directly (security through obscurity)
+- Future: can add rate limiting, circuit breaking without touching core-api
+
+#### Why Railway for All Backend Services?
+
+**Current:** AWS EC2 (backend) + Amazon RDS (database)
+
+| Factor | AWS EC2/RDS | Railway |
+|--------|-------------|---------|
+| Setup complexity | High — manual SSH, Docker, security groups | Low — GitHub repo connect, auto-deploy |
+| Scaling | Manual or via ASG + ALB (complex) | Auto-scaling built-in |
+| Cost (dev) | EC2 ~$10/mo + RDS ~$25/mo = $35/mo | ~$5/mo (Railway starter) |
+| Database managed | Separate RDS setup | Included in same platform |
+| Docker support | Yes, but manual | Native Docker container deploy |
+| GitOps | Manual SSH script via GitHub Actions | Connected repo auto-deploys |
+
+**Rationale:** Railway reduces ops overhead significantly. All backend services (gateway, core-api, gamification-engine) can be managed from one platform.
+
+#### Why RabbitMQ Instead of Spring ApplicationEventPublisher?
+
+**Current:** Spring `ApplicationEventPublisher` — events are in-process only, not persisted.
+
+**Problem:** If `yomu-core-api` restarts during quiz completion, events in-flight are lost. No replay capability.
+
+**Solution:** RabbitMQ (via CloudAMQP) provides:
+- **Durability** — messages persisted to disk, survive broker restart
+- **Replay** — gamification-engine can re-consume events if it restarts
+- **Decoupling** — services don't need to know each other's network addresses, only the exchange name
+
+#### Why Rust for Gamification Engine?
+
+From `yomu.md` line 14-15: "mahasiswa diharapkan dapat menciptakan solusi digital yang mampu meningkatkan standar literasi informasi di Indonesia."
+
+The gamification engine handles:
+- Heavy leaderboard calculations (sorted clans per tier)
+- Dynamic buff/debuff multipliers per strategy pattern
+- High-frequency mission progress updates
+
+**Rationale:** Rust's `sqlx` + async runtime handles these efficiently with minimal memory footprint. The architecture design document (`yomu-infra-gateway-design.md`) explicitly specifies Rust for this service.
+
+#### Why 3 PostgreSQL Schemas?
+
+**Current:** Single `public` schema with all tables mixed.
+
+**New:** Three logical schemas: `auth`, `quiz`, `gamification`
+
+**Rationale:** Aligns with microservice boundaries — each service owns its schema. `yomu-core-api` writes to `auth` and `quiz` schemas. `yomu-gamification-engine` writes to `gamification` schema. Clear ownership per `yomu.md` constraint.
+
+---
+
+### Risk Analysis
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| **RabbitMQ downtime** — broker unavailable causes event loss or service failure | Medium | High | CloudAMQP free tier has uptime ~99.9%. Add retry with dead-letter queue if event publish fails. |
+| **Gamification engine crash** — quiz events pile up in RabbitMQ queue | Medium | Medium | Monitor queue depth via RabbitMQ management UI. Implement consumer health checks. |
+| **JWT secret mismatch** — gateway and core-api use different secrets, causing auth failures | Low | Critical | Both must share same `JWT_SECRET` env var. Document in shared secrets manager. |
+| **Gateway routes to wrong core-api** — wrong `CORE_API_URL` env var | Low | Critical | Railway environment variable linking between services. Verify routing in staging before production. |
+| **Data migration** — existing EC2 data must migrate to Railway PostgreSQL without downtime | Medium | High | Use read replica sync, then switchover. Test migration script in staging first. |
+| **Google OAuth redirect URI mismatch** — URI still points to EC2 IP after migration | Medium | High | Update `GOOGLE_REDIRECT_URI` in Google Cloud Console to new gateway URL before cutting over. |
+| **CORS blocking** — Vercel origin not in gateway allowed-origins list | Low | High | Set `YOMU_WEB_URL` env var to exact Vercel URL. Test in staging. |
+| **Schema ownership conflict** — core-api and gamification-engine write to same schema | Low | High | Enforce schema isolation by DB role permissions: `core_api_user` can only write to `auth` and `quiz`. `gamification_user` can only write to `gamification`. |
+| **Rust service cold start** — Railway hibernation causes delayed event processing | Medium | Low | Railway Hobby tier spins down after 15 min inactivity. Upgrade to usage-based plan or implement queue consumer that handles delayed start. |
+| **Event schema drift** — core-api publishes event with extra field gamification-engine doesn't expect | Low | Medium | Maintain `EVENTS_CONTRACT.md` as source of truth. Add integration test to verify event shape. |
+
+---
+
+### Rollback Plan
+
+If migration fails at any step:
+
+1. **Before migration:** Tag current EC2 Docker image with `yomu-backend:v1`
+2. **Step 1-2 failure:** Revert GitHub Actions deploy workflow to SSH into EC2 and run existing container
+3. **Step 3-4 failure:** Keep EC2 running in parallel, point Vercel rewrite back to EC2 IP until Railway services are stable
+4. **After full migration:** Terminate EC2 instance only after 1 week stability period
