@@ -229,7 +229,7 @@ This section explains why the current architecture is being changed and the reas
 
 **Current State:** Single Spring Boot monolith (`yomu-backend`) handles all modules: auth, readings, quizzes, achievements, gamification logic, and event publishing.
 
-**Problem (per `yomu.md` line 165-169):**
+**Problem (per `yomu`):**
 > "setiap modul harus berinteraksi dengan modul lain melalui mekanisme komunikasi yang terdefinisi dengan jelas, tanpa berbagi state atau pemanggilan langsung antar komponen"
 
 The current monolith violates this — achievement and gamification logic are entangled in the same codebase, making independent iteration difficult and violating the separation of concerns requirement.
@@ -290,7 +290,7 @@ The gamification engine handles:
 
 **New:** Three logical schemas: `auth`, `quiz`, `gamification`
 
-**Rationale:** Aligns with microservice boundaries — each service owns its schema. `yomu-core-api` writes to `auth` and `quiz` schemas. `yomu-gamification-engine` writes to `gamification` schema. Clear ownership per `yomu.md` constraint.
+**Rationale:** Aligns with microservice boundaries — each service owns its schema. `yomu-core-api` writes to `auth` and `quiz` schemas. `yomu-gamification-engine` writes to `gamification` schema. Clear ownership per `yomu` constraint.
 
 ---
 
